@@ -1,0 +1,11 @@
+[profile.default]
+src = "src"
+out = "artifacts"
+libs = ["lib"]
+solc = "0.8.28"
+test = "test"
+cache_path = "cache"
+
+[rpc_endpoints]
+somnia = "https://api.infra.testnet.somnia.network/"
+somniaMainnet = "https://api.infra.mainnet.somnia.network/"
