@@ -1,0 +1,8 @@
+{
+  "/dashboard/page": "app/dashboard/page.js",
+  "/swap/page": "app/swap/page.js",
+  "/pools/page": "app/pools/page.js",
+  "/campaigns/page": "app/campaigns/page.js",
+  "/analytics/page": "app/analytics/page.js",
+  "/agents/page": "app/agents/page.js"
+}
