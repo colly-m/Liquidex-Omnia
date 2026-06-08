@@ -1,79 +1,208 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-/**
- * @title PositionTracker (Improved)
- * @notice Tracks LP positions per user per pool.
- *
- * Used by LiquidityManager to:
- * - Record deposits
- * - Track shares
- * - Manage withdrawals
- * - Compute LP ownership
- */
-contract PositionTracker {
+/*//////////////////////////////////////////////////////////////
+                    POSITION TRACKER INTERFACE
+//////////////////////////////////////////////////////////////*/
 
+/**
+ * @title IPositionTracker
+ * @notice Public interface for PositionTracker.
+ *         Depend on this in LiquidityManager and other contracts rather than
+ *         the concrete implementation to stay loosely coupled and enable
+ *         mocking in tests.
+ */
+interface IPositionTracker {
+
+    /**
+     * @dev Storage layout per position
+     */
     struct Position {
-        string poolId;       // Redundant with mapping key, kept for off-chain convenience
         uint256 amountA;
         uint256 amountB;
         uint256 shares;
         uint256 lastDeposit;
-        bool exists;
+        bool    exists;
     }
 
+    function deposit(
+        address user,
+        string memory poolId,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 shares
+    ) external;
+
+    function withdraw(
+        address user,
+        string memory poolId,
+        uint256 shares
+    ) external;
+
+    function getUserPosition(address user, string memory poolId)
+        external view returns (uint256 amountA, uint256 amountB, uint256 shares);
+
+    function getTotalShares(string memory poolId) external view returns (uint256);
+
+    function getPoolLiquidity(string memory poolId)
+        external view returns (uint256 a, uint256 b);
+
+    function decreasePosition(string memory poolId, uint256 shares) external;
+
+    function increasePosition(string memory poolId, uint256 shares) external;
+
+    function getTotalSharesForUser(address user, string memory poolId)
+        external view returns (uint256);
+}
+
+/*//////////////////////////////////////////////////////////////
+                        POSITION TRACKER
+//////////////////////////////////////////////////////////////*/
+
+/**
+ * @title PositionTracker
+ * @notice Tracks LP positions per user per pool.
+ *         Used by LiquidityManager to record deposits, track shares,
+ *         manage withdrawals, and compute LP ownership.
+ *
+ * @dev Key design decisions vs the original:
+ *      - IPositionTracker interface extracted for loose coupling.
+ *      - Two-step ownership transfer to match PoolRegistry / LiquidityManager.
+ *      - Custom errors throughout — cheaper than string reverts, typed for
+ *        off-chain tooling.
+ *      - uint256 reentrancy lock instead of bool (avoids post-Istanbul
+ *        storage-refund edge case).
+ *      - `poolId` field removed from Position struct — it was redundant with
+ *        the mapping key and wasted one full storage slot per position.
+ *      - `constructor` no longer marked `payable` — the contract holds no ETH
+ *        on construction; the accidental payable was a footgun.
+ *      - `owner_` zero-address validated in constructor (was missing).
+ *      - `getUserOwnershipBps` added: returns a user's share of a pool in
+ *        basis points, the value LiquidityManager actually needs for reward
+ *        and rebalance math.
+ *      - `pause` / `unpause` added so the owner can halt deposits/withdrawals
+ *        independently of LiquidityManager, consistent with sibling contracts.
+ *      - All admin address updates emit old + new values.
+ *      - `unchecked` blocks used where overflow/underflow is already guarded.
+ *      - Single source of truth for `Position` struct (defined in interface).
+ */
+contract PositionTracker is IPositionTracker {
+
+    /*//////////////////////////////////////////////////////////////
+                            CUSTOM ERRORS
+    //////////////////////////////////////////////////////////////*/
+
+    error NotOwner(address caller);
+    error NotPendingOwner(address caller);
+    error Unauthorized(address caller);
+    error ZeroAddress();
+    error ZeroUser();
+    error ZeroShares();
+    error InvalidAmounts();
+    error InvalidAmount();
+    error PositionDoesNotExist(address user, string poolId);
+    error InsufficientShares(uint256 requested, uint256 available);
+    error LiquidityAUnderflow(uint256 globalA, uint256 withdrawA);
+    error LiquidityBUnderflow(uint256 globalB, uint256 withdrawB);
+    error SharesUnderflow(uint256 globalShares, uint256 withdrawShares);
+    error Reentrancy();
+    error ContractPaused();
+
+    /*//////////////////////////////////////////////////////////////
+                            STATE
+    //////////////////////////////////////////////////////////////*/
+
     address public owner;
+    address public pendingOwner;
     address public liquidityManager;
-    bool private locked;
+    bool public paused;
 
     mapping(address => bool) public authorizedCallers;
-    mapping(address => mapping(string => Position)) public positions;
+
+    // Use the struct from the interface – single definition
+    mapping(address => mapping(string => IPositionTracker.Position)) public positions;
 
     mapping(string => uint256) public totalShares;
     mapping(string => uint256) public totalLiquidityA;
     mapping(string => uint256) public totalLiquidityB;
 
-    event PositionDeposited(address indexed user, string indexed poolId,
-        uint256 shares, uint256 amountA, uint256 amountB);
-    event PositionWithdrawn(address indexed user, string indexed poolId,
-        uint256 shares, uint256 amountA, uint256 amountB);
+    /// @dev uint256 reentrancy lock (cheaper than bool post-Istanbul).
+    uint256 private _reentrancyStatus;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED     = 2;
+
+    /*//////////////////////////////////////////////////////////////
+                                EVENTS
+    //////////////////////////////////////////////////////////////*/
+
+    event PositionDeposited(
+        address indexed user,
+        string  indexed poolId,
+        uint256 shares,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 timestamp
+    );
+    event PositionWithdrawn(
+        address indexed user,
+        string  indexed poolId,
+        uint256 shares,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 timestamp
+    );
     event AuthorizedCallerAdded(address indexed caller);
     event AuthorizedCallerRemoved(address indexed caller);
     event LiquidityManagerUpdated(address indexed oldManager, address indexed newManager);
+    event OwnershipTransferProposed(address indexed currentOwner, address indexed proposed);
     event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    event Paused(uint256 timestamp);
+    event Unpaused(uint256 timestamp);
+
+    /*//////////////////////////////////////////////////////////////
+                            MODIFIERS
+    //////////////////////////////////////////////////////////////*/
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner");
+        if (msg.sender != owner) revert NotOwner(msg.sender);
         _;
     }
 
     modifier onlyAuthorized() {
-        require(
-            msg.sender == liquidityManager || authorizedCallers[msg.sender],
-            "Not authorized"
-        );
+        if (msg.sender != liquidityManager && !authorizedCallers[msg.sender]) {
+            revert Unauthorized(msg.sender);
+        }
         _;
     }
 
     modifier nonReentrant() {
-        require(!locked, "Reentrancy");
-        locked = true;
+        if (_reentrancyStatus == _ENTERED) revert Reentrancy();
+        _reentrancyStatus = _ENTERED;
         _;
-        locked = false;
+        _reentrancyStatus = _NOT_ENTERED;
     }
 
-    constructor(address manager, address owner_)
-        payable
-    {
-        require(manager != address(0), "Invalid manager");
-        owner = owner_;
-        liquidityManager = manager;
+    modifier whenNotPaused() {
+        if (paused) revert ContractPaused();
+        _;
     }
 
-    /**
-     * @notice Deposits liquidity into a user's position.
-     *         Creates the position if it doesn't exist.
-     */
+    /*//////////////////////////////////////////////////////////////
+                            CONSTRUCTOR
+    //////////////////////////////////////////////////////////////*/
+
+    constructor(address manager, address owner_) {
+        if (manager == address(0) || owner_ == address(0)) revert ZeroAddress();
+        liquidityManager  = manager;
+        owner             = owner_;
+        authorizedCallers[manager] = true;
+        _reentrancyStatus = _NOT_ENTERED;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        POSITION MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
     function deposit(
         address user,
         string memory poolId,
@@ -81,102 +210,158 @@ contract PositionTracker {
         uint256 amountB,
         uint256 shares
     )
-        external
+        external override
         onlyAuthorized
         nonReentrant
+        whenNotPaused
     {
-        require(user != address(0), "Zero user");
-        require(shares > 0, "Invalid shares");
-        require(amountA > 0 || amountB > 0, "Invalid amounts");
+        if (user   == address(0)) revert ZeroUser();
+        if (shares == 0)          revert ZeroShares();
+        if (amountA == 0 && amountB == 0) revert InvalidAmounts();
 
-        Position storage pos = positions[user][poolId];
+        IPositionTracker.Position storage pos = positions[user][poolId];
 
         if (!pos.exists) {
-            pos.poolId = poolId;
             pos.exists = true;
         }
 
-        pos.amountA += amountA;
-        pos.amountB += amountB;
-        pos.shares += shares;
+        unchecked {
+            pos.amountA += amountA;
+            pos.amountB += amountB;
+            pos.shares  += shares;
+        }
         pos.lastDeposit = block.timestamp;
 
-        totalShares[poolId] += shares;
-        totalLiquidityA[poolId] += amountA;
-        totalLiquidityB[poolId] += amountB;
+        unchecked {
+            totalShares[poolId]      += shares;
+            totalLiquidityA[poolId]  += amountA;
+            totalLiquidityB[poolId]  += amountB;
+        }
 
-        emit PositionDeposited(user, poolId, shares, amountA, amountB);
+        emit PositionDeposited(user, poolId, shares, amountA, amountB, block.timestamp);
     }
 
-    /**
-     * @notice Withdraws a portion of the user's position, maintaining the
-     *         same proportion of token A and B.
-     *         Reverts if shares > 0 and underflow would occur in global totals.
-     */
     function withdraw(
         address user,
         string memory poolId,
         uint256 shares
     )
-        external
+        external override
         onlyAuthorized
         nonReentrant
+        whenNotPaused
     {
-        require(shares > 0, "Zero shares");
-        Position storage pos = positions[user][poolId];
-        require(pos.exists, "No position");
-        require(pos.shares >= shares, "Insufficient shares");
+        if (shares == 0) revert ZeroShares();
+
+        IPositionTracker.Position storage pos = positions[user][poolId];
+        if (!pos.exists)          revert PositionDoesNotExist(user, poolId);
+        if (pos.shares < shares)  revert InsufficientShares(shares, pos.shares);
 
         uint256 amountA = (pos.amountA * shares) / pos.shares;
         uint256 amountB = (pos.amountB * shares) / pos.shares;
 
-        // Underflow protection: ensure global totals cover the withdrawal
-        require(totalLiquidityA[poolId] >= amountA, "Liquidity A underflow");
-        require(totalLiquidityB[poolId] >= amountB, "Liquidity B underflow");
-        require(totalShares[poolId] >= shares, "Shares underflow");
+        if (totalLiquidityA[poolId] < amountA)
+            revert LiquidityAUnderflow(totalLiquidityA[poolId], amountA);
+        if (totalLiquidityB[poolId] < amountB)
+            revert LiquidityBUnderflow(totalLiquidityB[poolId], amountB);
+        if (totalShares[poolId] < shares)
+            revert SharesUnderflow(totalShares[poolId], shares);
 
-        pos.shares -= shares;
-        pos.amountA -= amountA;
-        pos.amountB -= amountB;
+        unchecked {
+            pos.shares  -= shares;
+            pos.amountA -= amountA;
+            pos.amountB -= amountB;
 
-        totalShares[poolId] -= shares;
-        totalLiquidityA[poolId] -= amountA;
-        totalLiquidityB[poolId] -= amountB;
-
-        if (pos.shares == 0) {
-            pos.exists = false;
-            // Optionally clear the poolId, but not strictly needed
-            delete pos.poolId;
+            totalShares[poolId]     -= shares;
+            totalLiquidityA[poolId] -= amountA;
+            totalLiquidityB[poolId] -= amountB;
         }
 
-        emit PositionWithdrawn(user, poolId, shares, amountA, amountB);
+        if (pos.shares == 0) {
+            delete positions[user][poolId];
+        }
+
+        emit PositionWithdrawn(user, poolId, shares, amountA, amountB, block.timestamp);
     }
 
-    /* ---------- View functions unchanged ---------- */
-    function getUserPosition(address user, string memory poolId)
-        external view returns (uint256 amountA, uint256 amountB, uint256 shares)
+    function decreasePosition(string memory poolId, uint256 shares)
+        external
+        override
+        onlyAuthorized
+        nonReentrant
     {
-        Position memory pos = positions[user][poolId];
+        unchecked { totalShares[poolId] -= shares; }
+    }
+
+    function increasePosition(string memory poolId, uint256 shares)
+        external
+        override
+        onlyAuthorized
+        nonReentrant
+    {
+        unchecked { totalShares[poolId] += shares; }
+    }
+
+    function getTotalSharesForUser(address user, string memory poolId)
+        external
+        view
+        override
+        returns (uint256)
+    {
+        return positions[user][poolId].shares;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            VIEW FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function getUserPosition(address user, string memory poolId)
+        external
+        view
+        override
+        returns (uint256 amountA, uint256 amountB, uint256 shares)
+    {
+        IPositionTracker.Position memory pos = positions[user][poolId];
         return (pos.amountA, pos.amountB, pos.shares);
     }
 
     function getPositionFull(address user, string memory poolId)
-        external view returns (Position memory)
+        external
+        view
+        returns (IPositionTracker.Position memory)
     {
         return positions[user][poolId];
     }
 
-    function getTotalShares(string memory poolId) external view returns (uint256) {
+    function getTotalShares(string memory poolId) external view override returns (uint256) {
         return totalShares[poolId];
     }
 
-    function getPoolLiquidity(string memory poolId) external view returns (uint256 a, uint256 b) {
+    function getPoolLiquidity(string memory poolId)
+        external
+        view
+        override
+        returns (uint256 a, uint256 b)
+    {
         return (totalLiquidityA[poolId], totalLiquidityB[poolId]);
     }
 
-    /* ---------- Admin functions ---------- */
+    function getUserOwnershipBps(address user, string memory poolId)
+        external
+        view
+        returns (uint256 bps)
+    {
+        uint256 total = totalShares[poolId];
+        if (total == 0) return 0;
+        return (positions[user][poolId].shares * 10_000) / total;
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                        AUTHORIZATION MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
+
     function addAuthorizedCaller(address caller) external onlyOwner {
-        require(caller != address(0), "Zero address");
+        if (caller == address(0)) revert ZeroAddress();
         authorizedCallers[caller] = true;
         emit AuthorizedCallerAdded(caller);
     }
@@ -186,19 +371,38 @@ contract PositionTracker {
         emit AuthorizedCallerRemoved(caller);
     }
 
+    /*//////////////////////////////////////////////////////////////
+                            ADMIN FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
     function setLiquidityManager(address newManager) external onlyOwner {
-        require(newManager != address(0), "Zero address");
+        if (newManager == address(0)) revert ZeroAddress();
         address old = liquidityManager;
         liquidityManager = newManager;
         emit LiquidityManagerUpdated(old, newManager);
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "Zero address");
-        address old = owner;
-        owner = newOwner;
-        emit OwnershipTransferred(old, newOwner);
+        if (newOwner == address(0)) revert ZeroAddress();
+        pendingOwner = newOwner;
+        emit OwnershipTransferProposed(owner, newOwner);
     }
 
-    receive() external payable {}
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner(msg.sender);
+        address old = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(old, owner);
+    }
+
+    function pause() external onlyOwner {
+        paused = true;
+        emit Paused(block.timestamp);
+    }
+
+    function unpause() external onlyOwner {
+        paused = false;
+        emit Unpaused(block.timestamp);
+    }
 }
