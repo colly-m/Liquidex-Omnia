@@ -5,7 +5,11 @@ libs = ["lib"]
 solc = "0.8.28"
 test = "test"
 cache_path = "cache"
+ffi = true
+optimizer_runs = 200
+evm_version = "paris"
 
 [rpc_endpoints]
-somnia = "https://api.infra.testnet.somnia.network/"
+somnia = "https://dream-rpc.somnia.network/"
+somniaTestnet = "https://dream-rpc.somnia.network/"
 somniaMainnet = "https://api.infra.mainnet.somnia.network/"

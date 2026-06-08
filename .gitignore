@@ -1,4 +1,5 @@
 .env
+.env.local
 node_modules
 
 # Foundry artifacts
@@ -19,3 +20,6 @@ lib/
 # OS
 .DS_Store
 Thumbs.db
+PHASES.md
+
+AGENTS.md

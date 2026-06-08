@@ -7,50 +7,40 @@ import "../src/PoolRegistry.sol";
 import "../src/PositionTracker.sol";
 
 contract LiquidityManagerTest is Test {
-    LiquidityManager public manager;
-    PoolRegistry public registry;
-    PositionTracker public tracker;
-    
-    address public platform = address(1);
-    address public owner = address(2);
+    address public constant PLATFORM = address(1);
+    address public constant OWNER = address(2);
 
-    constructor() {
-        registry = new PoolRegistry(owner, owner);
-        tracker = new PositionTracker(payable(owner), owner);
-        manager = new LiquidityManager(platform, address(registry), payable(address(tracker)), owner);
-        vm.prank(owner);
+    function testAll() public {
+        vm.startPrank(OWNER);
+        
+        PoolRegistry registry = new PoolRegistry(OWNER, OWNER);
+        PositionTracker tracker = new PositionTracker(OWNER, OWNER);
+        LiquidityManager manager = new LiquidityManager(PLATFORM, address(registry), payable(address(tracker)), OWNER, 0.03 ether, 0.07 ether);
         registry.setLiquidityManager(address(manager));
-    }
-
-    function testUpdatePoolMetrics() public {
-        vm.prank(owner);
+        tracker.setLiquidityManager(address(manager));
+        
+        // testUpdatePoolMetrics
         registry.addPool("pool1", address(10), address(11));
-        vm.prank(owner);
+        registry.addAuthorizedUpdater(OWNER);
         manager.updatePoolMetrics("pool1", address(10), address(11), 100, 1000);
         assert(manager.totalValueLocked() >= 1000);
-    }
-
-    function testPause() public {
-        vm.prank(owner);
+        
+        // testPause
         manager.pause();
         assert(manager.paused() == true);
-    }
-
-    function testUnpause() public {
-        vm.prank(owner);
-        manager.pause();
-        vm.prank(owner);
+        
+        // testUnpause
         manager.unpause();
         assert(manager.paused() == false);
-    }
-
-    function testExecuteRebalance() public {
-        vm.prank(owner);
+        
+        // testExecuteRebalance
         string[] memory pools = new string[](1);
         uint256[] memory amounts = new uint256[](1);
         pools[0] = "pool1";
         amounts[0] = 100;
         manager.executeRebalance(pools, amounts);
         assert(manager.lastRebalance() > 0);
+        
+        vm.stopPrank();
     }
 }

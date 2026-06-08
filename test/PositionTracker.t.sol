@@ -6,16 +6,15 @@ import "../src/PositionTracker.sol";
 
 contract PositionTrackerTest is Test {
     PositionTracker public tracker;
-    address public manager = address(1);
     address public owner = address(3);
     address public user = address(2);
 
     constructor() {
-        tracker = new PositionTracker(manager, owner);
+        tracker = new PositionTracker(owner, owner);
     }
 
     function testDeposit() public {
-        vm.prank(manager);
+        vm.prank(owner);
         tracker.deposit(user, "pool1", 100, 200, 50);
         
         (uint256 amountA, uint256 amountB, uint256 shares) = tracker.getUserPosition(user, "pool1");
@@ -26,9 +25,9 @@ contract PositionTrackerTest is Test {
     }
 
     function testMultipleDeposits() public {
-        vm.prank(manager);
+        vm.prank(owner);
         tracker.deposit(user, "pool1", 100, 200, 50);
-        vm.prank(manager);
+        vm.prank(owner);
         tracker.deposit(user, "pool1", 50, 100, 25);
         
         (uint256 amountA, uint256 amountB, uint256 shares) = tracker.getUserPosition(user, "pool1");
@@ -38,9 +37,9 @@ contract PositionTrackerTest is Test {
     }
 
     function testWithdraw() public {
-        vm.prank(manager);
+        vm.prank(owner);
         tracker.deposit(user, "pool1", 100, 200, 50);
-        vm.prank(manager);
+        vm.prank(owner);
         tracker.withdraw(user, "pool1", 20);
         
         (uint256 amountA, uint256 amountB, uint256 shares) = tracker.getUserPosition(user, "pool1");
